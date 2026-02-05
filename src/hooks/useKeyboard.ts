@@ -1,6 +1,7 @@
 import {useRef} from 'react';
 import {useInput} from 'ink';
 import {useTuiStore} from '../store/tui-store.js';
+import type {OverlayMode} from '../store/tui-store.js';
 
 interface KeyboardOptions {
 	disabled?: boolean;
@@ -10,6 +11,10 @@ interface KeyboardOptions {
 /**
  * Global keyboard hook for FLOYD TUI
  * Handles all keyboard shortcuts
+ *
+ * IMPORTANT: We do NOT use isActive: false because it turns off raw mode,
+ * which breaks ALL input handling including TextInput. Instead, we return
+ * early from the handler when overlays with their own input are active.
  */
 export function useKeyboard(options: KeyboardOptions = {}) {
 	const {disabled = false, onKeyPress} = options;
@@ -21,8 +26,24 @@ export function useKeyboard(options: KeyboardOptions = {}) {
 
 	const lastKeyPress = useRef<number>(0);
 
+	// Overlays that have their own input handling (via their own useInput hooks)
+	// When these are active, we skip global shortcut processing to let the overlay handle input
+	const overlaysWithOwnInput = new Set<OverlayMode>([
+		'command',
+		'history',
+		'background',
+		'rewind',
+	]);
+
+	// We keep the useInput handler ALWAYS active to maintain raw mode.
+	// We return early from the handler body when we don't want to process input.
 	useInput((input, key) => {
-		if (disabled) return;
+		// Skip global shortcuts when disabled or when an overlay with own input is active
+		// IMPORTANT: We return here WITHOUT using isActive: false, because that would
+		// turn off raw mode and break ALL input handling (including TextInput)
+		if (disabled || overlaysWithOwnInput.has(overlayMode)) {
+			return;
+		}
 
 		const now = Date.now();
 

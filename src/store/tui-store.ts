@@ -9,7 +9,7 @@ import {getRandomPhraseUnique} from '../utils/whimsical-phrases.js';
 import type {LLMProvider, AgentLLMClient} from '../llm/factory.js';
 import {loadFloydEnv, getProviderApiKey} from '../utils/providerConfig.js';
 import {TuiTagParser} from '../utils/tag-parser.js';
-import {ToolBridge} from '../mcp/tool-bridge.js';
+import {MCPClient} from '../mcp/mcp-client.js';
 import {
 	parsePrefixMode,
 	isBashCommand,
@@ -88,6 +88,7 @@ interface TuiStore {
 	connectionStatus: ConnectionStatus;
 	isThinking: boolean;
 	thinkingEnabled: boolean;
+	thinkingContent: string;
 	whimsicalPhrase: string | null;
 	messages: ChatMessage[];
 	streamingContent: string;
@@ -102,8 +103,8 @@ interface TuiStore {
 		onClose: () => void;
 	} | null;
 	_initialized: boolean;
-	// MCP ToolBridge integration
-	toolBridge: ToolBridge | null;
+	// MCP Client integration
+	mcpClient: MCPClient | null;
 	activeToolCalls: ToolCall[];
 	// Last tool call for !! shortcut (repeat last tool)
 	lastToolCall: StoredToolCall | null;
@@ -132,8 +133,8 @@ interface TuiStore {
 	savePreferences: () => Promise<void>;
 	loadPreferences: () => Promise<void>;
 	clearPreferences: () => Promise<void>;
-	// MCP ToolBridge actions
-	initializeToolBridge: () => Promise<void>;
+	// MCP Client actions
+	initializeMCPClient: () => Promise<void>;
 	setActiveToolCalls: (toolCalls: ToolCall[]) => void;
 	// Claude-style shortcuts
 	repeatLastTool: () => Promise<void>;
@@ -147,6 +148,7 @@ export const useTuiStore = create<TuiStore>((set, get) => ({
 	connectionStatus: 'offline',
 	isThinking: false,
 	thinkingEnabled: true,
+	thinkingContent: '',
 	whimsicalPhrase: null,
 	messages: [],
 	streamingContent: '',
@@ -155,7 +157,7 @@ export const useTuiStore = create<TuiStore>((set, get) => ({
 	backgroundTasks: [],
 	diffViewer: null,
 	_initialized: false,
-	toolBridge: null,
+	mcpClient: null,
 	activeToolCalls: [],
 	lastToolCall: null,
 
@@ -308,14 +310,13 @@ export const useTuiStore = create<TuiStore>((set, get) => ({
 					timestamp: Date.now(),
 				});
 
-				// Execute preset tool via toolBridge
-				let {toolBridge} = get();
+				// Execute preset tool via mcpClient
+				let {mcpClient} = get();
 
-				// Auto-initialize ToolBridge if not present
-				if (!toolBridge) {
-					toolBridge = new ToolBridge();
-					set({toolBridge});
-					console.log('[TUI] ToolBridge auto-initialized for preset tool');
+				// Auto-initialize MCPClient if not present
+				if (!mcpClient) {
+					mcpClient = new MCPClient();
+					set({mcpClient});
 				}
 
 				const callId = `${preset.tool}_${Date.now()}`;
@@ -327,7 +328,7 @@ export const useTuiStore = create<TuiStore>((set, get) => ({
 				});
 
 				try {
-					const result = await toolBridge.executeTool(preset.tool, preset.input);
+					const result = await mcpClient.executeTool(preset.tool, preset.input);
 					set({
 						activeToolCalls: get().activeToolCalls.map(call =>
 							call.id === callId
@@ -511,7 +512,7 @@ export const useTuiStore = create<TuiStore>((set, get) => ({
 		// Get endpoint from env if available
 		let baseURL = undefined;
 		if (provider === 'glm') {
-			baseURL = env.FLOYD_GLM_ENDPOINT || 'https://api.z.ai/api/anthropic';
+			baseURL = env.FLOYD_GLM_ENDPOINT || 'https://api.z.ai/api/coding/paas/v4/chat/completions';
 		}
 
 		if (!apiKey) {
@@ -532,30 +533,30 @@ export const useTuiStore = create<TuiStore>((set, get) => ({
 			baseURL,
 		});
 
-		// Initialize ToolBridge if using agent mode
+		// Initialize MCPClient if using agent mode
 		const useToolAgent = typeof process !== 'undefined' && process.env?.USE_TOOL_AGENT === 'true';
 		if (useToolAgent && 'setToolExecutor' in client) {
-			let {toolBridge} = get();
-			let isNewBridge = false;
-			if (!toolBridge) {
-				toolBridge = new ToolBridge();
-				set({toolBridge});
-				isNewBridge = true;
+			let {mcpClient} = get();
+			let isNewClient = false;
+			if (!mcpClient) {
+				mcpClient = new MCPClient();
+				set({mcpClient});
+				isNewClient = true;
 			}
 
 			// Type-safe narrowing: we already checked 'setToolExecutor' in client above
 			const agentClient = client as unknown as AgentLLMClient;
 
-			// Only discover tools once when bridge is first created
-			if (isNewBridge) {
-				let tools: {name: string; description: string; server: string; input_schema: Record<string, unknown>}[] = [];
+			// Only connect and discover tools once when client is first created
+			if (isNewClient) {
 				let formattedTools: {name: string; description: string; input_schema: Record<string, unknown>}[] = [];
 				try {
-					tools = await toolBridge.discoverTools();
-					formattedTools = await toolBridge.formatForLLM();
-					console.log(`[TUI] ToolBridge connected with ${tools.length} tools`);
+					await mcpClient.connect();
+					await mcpClient.discoverTools();
+					formattedTools = await mcpClient.formatForLLM();
+					// Silent: console.log(`[TUI] MCPClient connected with tools`);
 				} catch (discoveryError) {
-					console.error('[TUI] Tool discovery failed:', discoveryError);
+					console.error('[TUI] MCP connection/discovery failed:', discoveryError);
 					// Continue with empty tools - agent will work without tools
 				}
 				agentClient.setTools(formattedTools);
@@ -583,7 +584,7 @@ export const useTuiStore = create<TuiStore>((set, get) => ({
 						setTimeout(() => reject(new Error(`Tool execution timeout after ${TOOL_TIMEOUT_MS}ms`)), TOOL_TIMEOUT_MS);
 					});
 					result = await Promise.race([
-						toolBridge.executeTool(toolCall.name, toolCall.input),
+						mcpClient.executeTool(toolCall.name, toolCall.input),
 						timeoutPromise
 					]);
 				} catch (execError) {
@@ -654,6 +655,7 @@ export const useTuiStore = create<TuiStore>((set, get) => ({
 		set(state => ({
 			messages: [...state.messages, assistantMessage],
 			connectionStatus: 'online',
+			thinkingContent: '', // Clear any previous thinking content
 		}));
 
 		try {
@@ -673,14 +675,17 @@ export const useTuiStore = create<TuiStore>((set, get) => ({
 
 					if (event.type === 'tag_close' && event.tagName === 'thinking') {
 						inThinking = false;
-						// Brief pause after thinking
+						// Clear thinking content after thinking block ends
 						set({isThinking: false, whimsicalPhrase: null});
 						continue;
 					}
 
 					if (event.type === 'text' && event.content) {
 						if (inThinking) {
-							// Thinking content is suppressed from main transcript but keeps thinking status active
+							// Capture thinking content for display when thinking mode is enabled
+							set(state => ({
+								thinkingContent: state.thinkingContent + event.content
+							}));
 							continue;
 						}
 
@@ -710,6 +715,7 @@ export const useTuiStore = create<TuiStore>((set, get) => ({
 					msg.id === assistantId ? {...msg, streaming: false} : msg,
 				),
 				isThinking: false,
+				thinkingContent: '',
 				whimsicalPhrase: null,
 				activeToolCalls: [], // Clear completed tool calls
 			}));
@@ -775,10 +781,10 @@ export const useTuiStore = create<TuiStore>((set, get) => ({
 		});
 	},
 
-	initializeToolBridge: async () => {
-		const bridge = new ToolBridge();
-		set({toolBridge: bridge});
-		console.log('[TUI] ToolBridge initialized');
+	initializeMCPClient: async () => {
+		const client = new MCPClient();
+		await client.connect();
+		set({mcpClient: client});
 	},
 
 	setActiveToolCalls: (toolCalls: ToolCall[]) => {
@@ -787,7 +793,7 @@ export const useTuiStore = create<TuiStore>((set, get) => ({
 
 	// !! - Repeat last tool call shortcut
 	repeatLastTool: async () => {
-		const {lastToolCall, toolBridge} = get();
+		const {lastToolCall, mcpClient} = get();
 
 		if (!lastToolCall) {
 			get().addMessage({
@@ -799,11 +805,11 @@ export const useTuiStore = create<TuiStore>((set, get) => ({
 			return;
 		}
 
-		if (!toolBridge) {
+		if (!mcpClient) {
 			get().addMessage({
 				id: Math.random().toString(36).substring(7),
 				role: 'system',
-				content: '⚠️ ToolBridge not initialized.',
+				content: '⚠️ MCPClient not initialized.',
 				timestamp: Date.now(),
 			});
 			return;
@@ -828,7 +834,7 @@ export const useTuiStore = create<TuiStore>((set, get) => ({
 		});
 
 		try {
-			const result = await toolBridge.executeTool(lastToolCall.name, lastToolCall.input);
+			const result = await mcpClient.executeTool(lastToolCall.name, lastToolCall.input);
 
 			// Update status
 			set(state => ({
@@ -866,13 +872,13 @@ export const useTuiStore = create<TuiStore>((set, get) => ({
 
 	// !* - Execute all pending tool calls (batch approve)
 	executeAllPendingTools: async () => {
-		const {toolBridge, activeToolCalls} = get();
+		const {mcpClient, activeToolCalls} = get();
 
-		if (!toolBridge) {
+		if (!mcpClient) {
 			get().addMessage({
 				id: Math.random().toString(36).substring(7),
 				role: 'system',
-				content: '⚠️ ToolBridge not initialized.',
+				content: '⚠️ MCPClient not initialized.',
 				timestamp: Date.now(),
 			});
 			return;
@@ -909,7 +915,7 @@ export const useTuiStore = create<TuiStore>((set, get) => ({
 			}));
 
 			try {
-				const result = await toolBridge.executeTool(call.name, call.input);
+				const result = await mcpClient.executeTool(call.name, call.input);
 
 				// Update to success
 				set(state => ({

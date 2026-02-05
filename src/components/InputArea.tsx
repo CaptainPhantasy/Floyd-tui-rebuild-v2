@@ -1,7 +1,7 @@
 import * as Ink from 'ink';
 import TextInput from 'ink-text-input';
 import { useTuiStore } from '../store/tui-store.js';
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 
 const MAX_INPUT_LENGTH = 5000;
 const SUBMIT_DEBOUNCE_MS = 200;
@@ -13,6 +13,18 @@ export function InputArea() {
   const isThinking = useTuiStore((state) => state.isThinking);
   const overlayMode = useTuiStore((state) => state.overlayMode);
   const sendMessage = useTuiStore((state) => state.sendMessage);
+
+  // Clear input when overlay opens (prevents Ctrl+P from adding 'p' to chat)
+  useEffect(() => {
+    if (overlayMode !== 'none' && input) {
+      setInput('');
+    }
+  }, [overlayMode]);
+
+  // Hide input when overlays are active
+  if (overlayMode !== 'none') {
+    return null;
+  }
 
   const handleSubmit = (value: string) => {
     const now = Date.now();
