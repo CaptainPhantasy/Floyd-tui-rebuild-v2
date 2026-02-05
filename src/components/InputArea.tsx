@@ -52,7 +52,7 @@ export function InputArea() {
           Ctrl+P:Cmds Ctrl+/:Help Tab:Thinking Shift+Tab:Mode
         </Ink.Text>
         <Ink.Text dimColor color="#808080">
-          Ctrl+Q:Exit
+          !!:Retry !*:All /tools Ctrl+Q:Exit
         </Ink.Text>
       </Ink.Box>
     </Ink.Box>

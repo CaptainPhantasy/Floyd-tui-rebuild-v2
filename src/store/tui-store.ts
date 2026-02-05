@@ -6,10 +6,23 @@ import {
 	initializeState,
 } from '../utils/persistence.js';
 import {getRandomPhraseUnique} from '../utils/whimsical-phrases.js';
-import type {LLMProvider} from '../llm/factory.js';
+import type {LLMProvider, AgentLLMClient} from '../llm/factory.js';
 import {loadFloydEnv, getProviderApiKey} from '../utils/providerConfig.js';
-
 import {TuiTagParser} from '../utils/tag-parser.js';
+import {ToolBridge} from '../mcp/tool-bridge.js';
+import {
+	parsePrefixMode,
+	isBashCommand,
+	isSlashCommand,
+	parseBashCommand,
+	parseSlashCommand,
+	parseAgentDelegation,
+	parseToolInvocation,
+	validateBashCommand,
+	getPresetToolCall,
+	SLASH_COMMANDS,
+	type ParsedInput,
+} from '../utils/prefix-parser.js';
 
 export type OverlayMode =
 	| 'none'
@@ -53,10 +66,19 @@ export interface ChatMessage {
 }
 
 interface ToolCall {
+	id?: string;
 	name: string;
+	input?: Record<string, unknown>;
 	status: 'pending' | 'running' | 'success' | 'error';
-	result?: string;
-	error?: string;
+	result?: string | undefined;
+	error?: string | undefined;
+}
+
+// Stored tool call for replay with !! shortcut
+interface StoredToolCall {
+	name: string;
+	input: Record<string, unknown>;
+	timestamp: number;
 }
 
 interface TuiStore {
@@ -80,6 +102,11 @@ interface TuiStore {
 		onClose: () => void;
 	} | null;
 	_initialized: boolean;
+	// MCP ToolBridge integration
+	toolBridge: ToolBridge | null;
+	activeToolCalls: ToolCall[];
+	// Last tool call for !! shortcut (repeat last tool)
+	lastToolCall: StoredToolCall | null;
 
 	setMode: (mode: FloydMode) => void;
 	cycleMode: () => void;
@@ -105,6 +132,12 @@ interface TuiStore {
 	savePreferences: () => Promise<void>;
 	loadPreferences: () => Promise<void>;
 	clearPreferences: () => Promise<void>;
+	// MCP ToolBridge actions
+	initializeToolBridge: () => Promise<void>;
+	setActiveToolCalls: (toolCalls: ToolCall[]) => void;
+	// Claude-style shortcuts
+	repeatLastTool: () => Promise<void>;
+	executeAllPendingTools: () => Promise<void>;
 }
 
 export const useTuiStore = create<TuiStore>((set, get) => ({
@@ -122,6 +155,9 @@ export const useTuiStore = create<TuiStore>((set, get) => ({
 	backgroundTasks: [],
 	diffViewer: null,
 	_initialized: false,
+	toolBridge: null,
+	activeToolCalls: [],
+	lastToolCall: null,
 
 	setMode: mode => {
 		set({mode});
@@ -210,86 +246,231 @@ export const useTuiStore = create<TuiStore>((set, get) => ({
 	sendMessage: async content => {
 		const trimmedContent = content.trim();
 
-		// Handle prefixes
-		if (trimmedContent.startsWith('!')) {
-			const command = trimmedContent.slice(1).trim();
-			get().addBackgroundTask({
-				command,
-				status: 'running',
-				startTime: Date.now(),
-			});
-			// For now, we just acknowledge it. 
-			// In a real implementation, this would trigger the actual execution.
+		// ========================================================================
+		// PREFIX MODE DETECTION (Claude Code alignment - "47% Gift")
+		// ========================================================================
+		const parsed: ParsedInput = parsePrefixMode(trimmedContent);
+
+		// Handle shortcuts (!!, !*, !c, !u, !r)
+		if (parsed.shortcut === 'repeatLast') {
+			await get().repeatLastTool();
+			return 'Repeating last tool call...';
+		}
+
+		if (parsed.shortcut === 'executeAll') {
+			await get().executeAllPendingTools();
+			return 'Executing all pending tools...';
+		}
+
+		if (parsed.shortcut === 'continue') {
 			get().addMessage({
 				id: Math.random().toString(36).substring(7),
 				role: 'system',
-				content: `🚀 Executing direct command: ${command}`,
+				content: '⏩ Continuing last task...',
 				timestamp: Date.now(),
 			});
-			return `Direct command execution started: ${command}`;
+			return 'Continuing...';
 		}
 
-		if (trimmedContent.startsWith('/')) {
-			const parts = trimmedContent.slice(1).split(' ');
-			const command = parts[0]?.toLowerCase();
-			const args = parts.slice(1).join(' ');
-
-			if (command === 'commit') {
-				get().addMessage({
-					id: Math.random().toString(36).substring(7),
-					role: 'system',
-					content: `📦 Preparing commit with message: ${args || 'Auto-generated message'}`,
-					timestamp: Date.now(),
-				});
-				// Stub for commit logic
-				return `Commit workflow started.`;
-			}
-
-			if (command === 'help') {
-				get().setOverlayMode('help');
-				return 'Opening help...';
-			}
-
-			if (command === 'exit' || command === 'quit') {
-				get().addMessage({
-					id: Math.random().toString(36).substring(7),
-					role: 'system',
-					content: '👋 Goodbye!',
-					timestamp: Date.now(),
-				});
-				setTimeout(() => process.exit(0), 500);
-				return 'Exiting...';
-			}
+		if (parsed.shortcut === 'undo') {
+			get().undoLastExchange();
+			get().addMessage({
+				id: Math.random().toString(36).substring(7),
+				role: 'system',
+				content: '↩️ Undid last exchange',
+				timestamp: Date.now(),
+			});
+			return 'Undo complete';
 		}
 
-		if (trimmedContent.startsWith('&')) {
-			const command = trimmedContent.slice(1).trim();
+		if (parsed.shortcut === 'redo') {
+			get().addMessage({
+				id: Math.random().toString(36).substring(7),
+				role: 'system',
+				content: '↪️ Redo - feature coming soon',
+				timestamp: Date.now(),
+			});
+			return 'Redo coming soon';
+		}
+
+		// Handle bash mode (!command)
+		if (isBashCommand(parsed)) {
+			const {command, args} = parseBashCommand(parsed.cleanInput);
+			const fullCommand = `${command} ${args.join(' ')}`.trim();
+
+			// Check for preset tool calls first
+			const preset = getPresetToolCall(fullCommand);
+			if (preset) {
+				get().addMessage({
+					id: Math.random().toString(36).substring(7),
+					role: 'user',
+					content: `!${fullCommand}`,
+					timestamp: Date.now(),
+				});
+
+				// Execute preset tool via toolBridge
+				let {toolBridge} = get();
+
+				// Auto-initialize ToolBridge if not present
+				if (!toolBridge) {
+					toolBridge = new ToolBridge();
+					set({toolBridge});
+					console.log('[TUI] ToolBridge auto-initialized for preset tool');
+				}
+
+				const callId = `${preset.tool}_${Date.now()}`;
+				set({
+					activeToolCalls: [
+						...get().activeToolCalls,
+						{id: callId, name: preset.tool, status: 'running'},
+					],
+				});
+
+				try {
+					const result = await toolBridge.executeTool(preset.tool, preset.input);
+					set({
+						activeToolCalls: get().activeToolCalls.map(call =>
+							call.id === callId
+								? {...call, status: 'success' as const, result: JSON.stringify(result).slice(0, 200)}
+								: call,
+						),
+						lastToolCall: {
+							name: preset.tool,
+							input: preset.input,
+							timestamp: Date.now(),
+						},
+					});
+
+					get().addMessage({
+						id: Math.random().toString(36).substring(7),
+						role: 'assistant',
+						content: `[Tool Result] ${preset.description} completed successfully`,
+						timestamp: Date.now(),
+						toolCalls: [{id: callId, name: preset.tool, status: 'success'}],
+					});
+					return `Executed: ${preset.description}`;
+				} catch (error) {
+					set({
+						activeToolCalls: get().activeToolCalls.map(call =>
+							call.id === callId
+								? {...call, status: 'error' as const, error: String(error)}
+								: call,
+						),
+					});
+					return `Tool failed: ${error}`;
+				}
+			}
+
+			// Validate bash command safety
+			const warnings = validateBashCommand(fullCommand);
+			if (warnings.length > 0) {
+				const mode = get().mode;
+				if (mode !== 'fuckit' && mode !== 'auto') {
+					get().addMessage({
+						id: Math.random().toString(36).substring(7),
+						role: 'system',
+						content: `⚠️ Dangerous command detected:\n${warnings.join('\n')}\n\nSwitch to FUCKIT mode to override.`,
+						timestamp: Date.now(),
+					});
+					return 'Command blocked - dangerous operation detected';
+				}
+			}
+
+			// Add bash command as background task
 			get().addBackgroundTask({
-				command,
+				command: fullCommand,
 				status: 'running',
 				startTime: Date.now(),
 			});
-			return `Background task started: ${command}`;
+
+			get().addMessage({
+				id: Math.random().toString(36).substring(7),
+				role: 'user',
+				content: `!${fullCommand}`,
+				timestamp: Date.now(),
+			});
+
+			// Fall through to LLM for bash execution
+			content = `Execute this bash command: ${fullCommand}`;
 		}
 
-		// Handle @ prefix for file references
-		if (trimmedContent.startsWith('@')) {
-			const filePath = trimmedContent.slice(1).trim();
+		// Handle slash commands (/help, /explain, etc.)
+		else if (isSlashCommand(parsed)) {
+			const {command, args} = parseSlashCommand(parsed.cleanInput);
+
+			// Check built-in slash commands
+			const slashCmd = SLASH_COMMANDS[command];
+			if (slashCmd) {
+				const result = await slashCmd.handler(args);
+				get().addMessage({
+					id: Math.random().toString(36).substring(7),
+					role: 'system',
+					content: result,
+					timestamp: Date.now(),
+				});
+				return result;
+			}
+
+			// Unknown slash command
+			get().addMessage({
+				id: Math.random().toString(36).substring(7),
+				role: 'system',
+				content: `⚠️ Unknown command: /${command}\nType /help for available commands`,
+				timestamp: Date.now(),
+			});
+			return `Unknown command: /${command}`;
+		}
+
+		// Handle agent mode (@agent task)
+		else if (parsed.mode === 'agent') {
+			const {agent, instruction} = parseAgentDelegation(parsed.cleanInput);
+
+			get().addMessage({
+				id: Math.random().toString(36).substring(7),
+				role: 'user',
+				content: `@${agent}: ${instruction}`,
+				timestamp: Date.now(),
+			});
+
+			// Delegate to sub-agent (future feature)
+			content = `I'm delegating this task to the @${agent} agent: ${instruction}`;
+		}
+
+		// Handle tool mode (&tool args)
+		else if (parsed.mode === 'tool') {
+			const {tool, args} = parseToolInvocation(parsed.cleanInput);
+
+			get().addMessage({
+				id: Math.random().toString(36).substring(7),
+				role: 'user',
+				content: `&${tool} ${args}`,
+				timestamp: Date.now(),
+			});
+
+			// Direct tool invocation (future feature)
+			content = `Invoke tool ${tool} with args: ${args}`;
+		}
+
+		// Handle file reference mode (>file)
+		else if (parsed.mode === 'file') {
+			const filePath = parsed.cleanInput;
+
 			get().addMessage({
 				id: Math.random().toString(36).substring(7),
 				role: 'system',
 				content: `📁 File reference: ${filePath}`,
 				timestamp: Date.now(),
 			});
+
 			// Include file in context for next message
-			// For now, acknowledge the file reference - actual file reading would be done by the assistant
-			return `File reference added: ${filePath}`;
+			content = `I'm referencing file: ${filePath}`;
 		}
 
+		// Normal mode - continue with standard LLM message handling
 		const userMessage: ChatMessage = {
 			id: Math.random().toString(36).substring(7),
 			role: 'user',
-			content,
+			content: parsed.isPrefixed ? content : parsed.cleanInput,
 			timestamp: Date.now(),
 		};
 		const phrase = getRandomPhraseUnique(get().whimsicalPhrase ?? undefined);
@@ -350,6 +531,114 @@ export const useTuiStore = create<TuiStore>((set, get) => ({
 			model: effectiveModel,
 			baseURL,
 		});
+
+		// Initialize ToolBridge if using agent mode
+		const useToolAgent = typeof process !== 'undefined' && process.env?.USE_TOOL_AGENT === 'true';
+		if (useToolAgent && 'setToolExecutor' in client) {
+			let {toolBridge} = get();
+			let isNewBridge = false;
+			if (!toolBridge) {
+				toolBridge = new ToolBridge();
+				set({toolBridge});
+				isNewBridge = true;
+			}
+
+			// Type-safe narrowing: we already checked 'setToolExecutor' in client above
+			const agentClient = client as unknown as AgentLLMClient;
+
+			// Only discover tools once when bridge is first created
+			if (isNewBridge) {
+				let tools: {name: string; description: string; server: string; input_schema: Record<string, unknown>}[] = [];
+				let formattedTools: {name: string; description: string; input_schema: Record<string, unknown>}[] = [];
+				try {
+					tools = await toolBridge.discoverTools();
+					formattedTools = await toolBridge.formatForLLM();
+					console.log(`[TUI] ToolBridge connected with ${tools.length} tools`);
+				} catch (discoveryError) {
+					console.error('[TUI] Tool discovery failed:', discoveryError);
+					// Continue with empty tools - agent will work without tools
+				}
+				agentClient.setTools(formattedTools);
+			}
+
+			// Set up tool executor callback
+			agentClient.setToolExecutor(async (toolCall) => {
+				// Generate unique call ID for this execution
+				const callId = `${toolCall.name}_${Date.now()}_${Math.random().toString(36).substr(2, 7)}`;
+
+				// Update active tool calls for UI
+				const currentCalls = get().activeToolCalls;
+				set({
+					activeToolCalls: [
+						...currentCalls,
+						{id: callId, name: toolCall.name, status: 'running'},
+					],
+				});
+
+				let result;
+				const TOOL_TIMEOUT_MS = 30000; // 30 second timeout
+				try {
+					// Execute the tool with timeout
+					const timeoutPromise = new Promise<never>((_, reject) => {
+						setTimeout(() => reject(new Error(`Tool execution timeout after ${TOOL_TIMEOUT_MS}ms`)), TOOL_TIMEOUT_MS);
+					});
+					result = await Promise.race([
+						toolBridge.executeTool(toolCall.name, toolCall.input),
+						timeoutPromise
+					]);
+				} catch (execError) {
+					result = {
+						success: false,
+						error: execError instanceof Error ? execError.message : String(execError),
+						tool: toolCall.name,
+						server: 'unknown',
+						timestamp: Date.now(),
+					};
+				}
+
+				// Update tool call status by unique ID
+				const updatedCalls = get().activeToolCalls.map(call =>
+					call.id === callId
+						? {...call, status: (result.success ? 'success' : 'error') as ToolCall['status'], result: result.success ? JSON.stringify(result.data) : undefined, error: result.error}
+						: call,
+				);
+				set({activeToolCalls: updatedCalls});
+
+				// Store successful tool call for !! shortcut (repeat last tool)
+				if (result.success) {
+					set({
+						lastToolCall: {
+							name: toolCall.name,
+							input: toolCall.input,
+							timestamp: Date.now(),
+						},
+					});
+				}
+
+				// Add tool result message to conversation
+				const resultContent = result.success
+					? `Tool "${toolCall.name}" completed successfully`
+					: `Tool "${toolCall.name}" failed: ${result.error || 'Unknown error'}`;
+
+				// TODO: Tool results displayed as 'assistant' for UI compatibility
+			// GLM agent client maintains separate message history for LLM API
+			get().addMessage({
+					id: Math.random().toString(36).substring(7),
+					role: 'assistant',
+					content: `[Tool Result] ${resultContent}`,
+					timestamp: Date.now(),
+					toolCalls: [{id: callId, name: toolCall.name, status: (result.success ? 'success' : 'error') as ToolCall['status']}],
+				});
+
+				return {
+					toolUseId: toolCall.id,
+					content: result.success
+						? JSON.stringify(result.data)
+						: result.error || 'Unknown error',
+					isError: !result.success,
+				};
+			});
+		}
 
 		// Create assistant message for streaming
 		const assistantId = Math.random().toString(36).substring(7);
@@ -415,24 +704,26 @@ export const useTuiStore = create<TuiStore>((set, get) => ({
 				}
 			});
 
-			// Final update - mark streaming complete
+			// Final update - mark streaming complete and clear active tool calls
 			set(state => ({
 				messages: state.messages.map(msg =>
 					msg.id === assistantId ? {...msg, streaming: false} : msg,
 				),
 				isThinking: false,
 				whimsicalPhrase: null,
+				activeToolCalls: [], // Clear completed tool calls
 			}));
 
 			return fullResponse;
 		} catch (error) {
 			console.error('Failed to send message:', error);
 
-			// Remove the incomplete assistant message on error
+			// Remove the incomplete assistant message on error and clear tool calls
 			set(state => ({
 				messages: state.messages.filter(msg => msg.id !== assistantId),
 				isThinking: false,
 				connectionStatus: 'offline',
+				activeToolCalls: [], // Clear any stuck tool calls on error
 			}));
 
 			throw error;
@@ -481,6 +772,179 @@ export const useTuiStore = create<TuiStore>((set, get) => ({
 			thinkingEnabled: true,
 			provider: 'glm',
 			model: 'GLM-4.7',
+		});
+	},
+
+	initializeToolBridge: async () => {
+		const bridge = new ToolBridge();
+		set({toolBridge: bridge});
+		console.log('[TUI] ToolBridge initialized');
+	},
+
+	setActiveToolCalls: (toolCalls: ToolCall[]) => {
+		set({activeToolCalls: toolCalls});
+	},
+
+	// !! - Repeat last tool call shortcut
+	repeatLastTool: async () => {
+		const {lastToolCall, toolBridge} = get();
+
+		if (!lastToolCall) {
+			get().addMessage({
+				id: Math.random().toString(36).substring(7),
+				role: 'system',
+				content: '⚠️ No previous tool call to repeat. Use a tool first, then !! will replay it.',
+				timestamp: Date.now(),
+			});
+			return;
+		}
+
+		if (!toolBridge) {
+			get().addMessage({
+				id: Math.random().toString(36).substring(7),
+				role: 'system',
+				content: '⚠️ ToolBridge not initialized.',
+				timestamp: Date.now(),
+			});
+			return;
+		}
+
+		// Generate call ID
+		const callId = `${lastToolCall.name}_${Date.now()}_${Math.random().toString(36).substr(2, 7)}`;
+
+		// Add to active calls
+		set(state => ({
+			activeToolCalls: [
+				...state.activeToolCalls,
+				{id: callId, name: lastToolCall.name, status: 'running'},
+			],
+		}));
+
+		get().addMessage({
+			id: Math.random().toString(36).substring(7),
+			role: 'system',
+			content: `🔄 Repeating tool: ${lastToolCall.name}`,
+			timestamp: Date.now(),
+		});
+
+		try {
+			const result = await toolBridge.executeTool(lastToolCall.name, lastToolCall.input);
+
+			// Update status
+			set(state => ({
+				activeToolCalls: state.activeToolCalls.map(call =>
+					call.id === callId
+						? {...call, status: 'success' as const, result: JSON.stringify(result).slice(0, 200)}
+						: call,
+				),
+			}));
+
+			get().addMessage({
+				id: Math.random().toString(36).substring(7),
+				role: 'assistant',
+				content: `[Tool Result] ${lastToolCall.name} completed successfully`,
+				timestamp: Date.now(),
+				toolCalls: [{id: callId, name: lastToolCall.name, status: 'success'}],
+			});
+		} catch (error) {
+			set(state => ({
+				activeToolCalls: state.activeToolCalls.map(call =>
+					call.id === callId
+						? {...call, status: 'error' as const, error: String(error)}
+						: call,
+				),
+			}));
+
+			get().addMessage({
+				id: Math.random().toString(36).substring(7),
+				role: 'system',
+				content: `❌ Tool "${lastToolCall.name}" failed: ${error}`,
+				timestamp: Date.now(),
+			});
+		}
+	},
+
+	// !* - Execute all pending tool calls (batch approve)
+	executeAllPendingTools: async () => {
+		const {toolBridge, activeToolCalls} = get();
+
+		if (!toolBridge) {
+			get().addMessage({
+				id: Math.random().toString(36).substring(7),
+				role: 'system',
+				content: '⚠️ ToolBridge not initialized.',
+				timestamp: Date.now(),
+			});
+			return;
+		}
+
+		const pendingCalls = activeToolCalls.filter(call => call.status === 'pending');
+
+		if (pendingCalls.length === 0) {
+			get().addMessage({
+				id: Math.random().toString(36).substring(7),
+				role: 'system',
+				content: 'ℹ️ No pending tool calls to execute.',
+				timestamp: Date.now(),
+			});
+			return;
+		}
+
+		get().addMessage({
+			id: Math.random().toString(36).substring(7),
+			role: 'system',
+			content: `🚀 Executing ${pendingCalls.length} pending tool(s)...`,
+			timestamp: Date.now(),
+		});
+
+		// Execute all pending tools in parallel
+		const executions = pendingCalls.map(async (call) => {
+			if (!call.input) return;
+
+			// Update to running
+			set(state => ({
+				activeToolCalls: state.activeToolCalls.map(c =>
+					c.id === call.id ? {...c, status: 'running'} : c,
+				),
+			}));
+
+			try {
+				const result = await toolBridge.executeTool(call.name, call.input);
+
+				// Update to success
+				set(state => ({
+					activeToolCalls: state.activeToolCalls.map(c =>
+						c.id === call.id
+							? {...c, status: 'success' as const, result: JSON.stringify(result).slice(0, 200)}
+							: c,
+					),
+				}));
+
+				get().addMessage({
+					id: Math.random().toString(36).substring(7),
+					role: 'assistant',
+					content: `[Tool Result] ${call.name} completed`,
+					timestamp: Date.now(),
+					toolCalls: [{id: call.id!, name: call.name, status: 'success'}],
+				});
+			} catch (error) {
+				set(state => ({
+					activeToolCalls: state.activeToolCalls.map(c =>
+						c.id === call.id
+							? {...c, status: 'error' as const, error: String(error)}
+							: c,
+					),
+				}));
+			}
+		});
+
+		await Promise.all(executions);
+
+		get().addMessage({
+			id: Math.random().toString(36).substring(7),
+			role: 'system',
+			content: `✓ Batch execution complete for ${pendingCalls.length} tool(s)`,
+			timestamp: Date.now(),
 		});
 	},
 }));
